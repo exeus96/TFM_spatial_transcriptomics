@@ -1,0 +1,488 @@
+---
+title: "Analisis datos"
+output: html_document
+date: "2023-04-03"
+---
+
+```{r setup,include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries,include=TRUE,message=FALSE,echo=FALSE}
+library(tidyverse)
+library(pagoda2)
+library(magrittr)
+library(pbapply)
+library(dataorganizer)
+library(Seurat)
+library(scrattch.io)
+library(conos)
+library(cacoa)
+library(circlize)
+library(ComplexHeatmap)
+library(clusterProfiler)
+options(bitmapType="cairo")
+```
+
+Primero se cargan todas las muestras analizadas mediante transcriptomica espacial
+
+```{r load_transcriptomic_data,include=TRUE,message=FALSE,echo=FALSE}
+dataPath <- function(...) 
+  file.path("/home/jsantiago/snRNA-seq_and_spatial_transcriptomics/visium_spaceranger_output/", ...)
+annotationPath <- function(...)
+  file.path("/home/jsantiago/snRNA-seq_and_spatial_transcriptomics/cortical_annotations/", ...)
+kDatasetNames <- c("MB11", "MB18-2", "MB23","MB6", "MB19") %>% 
+  setNames(., .)
+
+samples <- kDatasetNames %>% pblapply(function(n) {
+sp <- dataPath(paste0(n, '/outs/spatial/tissue_positions_list.csv')) %>% 
+     read_csv(col_names=F) %>% as.data.frame() %>% set_rownames(.$X1) %>% .[,5:6] %>% 
+     set_colnames(c("x", "y"))
+   cm <- dataPath(paste0(n, "/outs/filtered_feature_bc_matrix.h5")) %>% Seurat::Read10X_h5()
+   ann <- annotationPath(paste0(n,'.csv')) %>% read_csv() %$% 
+     setNames(.[[2]], Barcode) %>% .[. != "WM"]
+   cm <- cm[, names(ann)]
+   sp <- sp[names(ann),]
+   colnames(cm) <- rownames(sp) <- names(ann) <- paste0(n, "_", names(ann))
+   seu <- CreateSeuratObject(cm,assay = 'Spatial')
+   seu@images$image <-  new(
+    Class = 'SlideSeq',
+    assay = "Spatial",
+    key = "image_",
+    coordinates = sp
+  )
+   p2 <- Pagoda2$new(cm,n.cores=8)
+   p2$adjustVariance(plot=F)
+   p2$calculatePcaReduction(nPcs=50,n.odgenes=3e3)
+   p2$getEmbedding(type='PCA',embeddingType='UMAP',verbose=F)
+   list(cm=cm, annotation=ann, position=sp, p2=p2, seu=seu)
+   })
+deconv_path <- "/home/jsantiago/deconvolution_med/deconv_med/"
+samplegroups <- list(
+  control = c('MB11', 'MB19', 'MB18-2'),
+  schizo = c('MB6','MB23')
+)
+for(n in names(samples)) {
+  samples[[n]]$deconv_probs <- read.table(paste0(deconv_path, n,"/",n,".tsv"))
+  rownames(samples[[n]]$deconv_probs) = paste0(n,"_",rownames(samples[[n]]$deconv_prob))
+  cm <- samples[[n]]$cm
+  samples[[n]]$mit_frac <- Matrix::colSums(cm[grep("^MT-", rownames(cm)),]) / Matrix::colSums(cm)
+}
+for(n in names(samples)) {
+  samples[[n]]$deconv_probs = samples[[n]]$deconv_probs[names(samples[[n]]$annotation),]
+  maxColumnNames <- apply(samples[[n]]$deconv_probs,1,function(row) colnames(samples[[n]]$deconv_probs)[which.max(row)])
+  samples[[n]]$seu@meta.data['cell_type'] <- maxColumnNames
+}
+
+```
+
+```{r}
+for(n in names(samples)) {
+  total_counts_per_spot <- colSums(samples[[n]]$seu@assays$Spatial)
+  is_mito <- grepl("(^MT-)|(^mt-)", rownames(samples[[n]]$cm))
+  samples[[n]]$seu$percent_mito =  colSums(samples[[n]]$seu@assays$Spatial[is_mito, ])/total_counts_per_spot
+  feats <- c("nFeature_Spatial", "nCount_Spatial", "percent_mito")
+  discarded_library_size <- WhichCells(samples[[n]]$seu, expression = (nCount_Spatial < 600 | nCount_Spatial > 50000))
+  discarded_expressed <- WhichCells(samples[[n]]$seu, expression = (nFeature_Spatial < 1000|nFeature_Spatial > 1000000))
+  discarded_mito <- WhichCells(samples[[n]]$seu, expression = (percent_mito > (max(samples[[n]]$seu$percent_mito) - 0.05)|percent_mito < 0) )
+  discarded = union(discarded_library_size,union(discarded_expressed,discarded_mito))
+  samples[[n]]$seu = subset(samples[[n]]$seu, cells = discarded, invert=TRUE)
+  p2 <- Pagoda2$new(samples[[n]]$seu@assays$Spatial@counts,n.cores=8)
+  p2$adjustVariance(plot=F)
+  p2$calculatePcaReduction(nPcs=50,n.odgenes=3e3)
+  p2$getEmbedding(type='PCA',embeddingType='UMAP',verbose=F)
+  samples[[n]]$p2 <- p2
+  samples[[n]]$annotation <- samples[[n]]$annotation[names(samples[[n]]$annotation) %in% colnames(samples[[n]]$seu)]
+}
+
+```
+
+A continución se le anyaden a las muestras los resultados de la deconvolucion, así como la información de las capas, y se realiza el analisis de expresión diferencial empleando la libreria cacoa.
+
+```{r calculate_de,include=TRUE,message=FALSE,echo=FALSE}
+
+deconv_path <- "/home/jsantiago/deconvolution_med/deconv_med/"
+samplegroups <- list(
+  control = c('MB11', 'MB19', 'MB18-2'),
+  schizo = c('MB6','MB23')
+)
+for(n in names(samples)) {
+  samples[[n]]$deconv_probs <- read.table(paste0(deconv_path, n,"/",n,".tsv"))
+  cm <- samples[[n]]$cm
+  samples[[n]]$mit_frac <- Matrix::colSums(cm[grep("^MT-", rownames(cm)),]) / Matrix::colSums(cm)
+}
+
+
+annot_spat <- lapply(samples, `[[`, "annotation") %>% Reduce(c, .)
+#Create conos and cacoa object for DE
+con_spat <- lapply(samples, `[[`, "p2") %>% Conos$new()
+cao <- Cacoa$new(con_spat, 
+                 ref.level="Ctr", 
+                 target.level="Scz", 
+                 sample.groups=setNames(c(rep("Ctr", 3),rep("Scz", 2)),unlist(samplegroups, use.names = FALSE)), 
+                 cell.groups=(annot_spat), 
+                 n.cores=5)
+de_spat_annot_hombres <- cao$estimatePerCellTypeDE(n.cores = 20)
+save(de_spat_annot_hombres,file = './data/de_spat_annot_hombres_hombres.Rdata')
+```
+
+Seguidamente se analizan que procesos GO están sobrerepresentados en base a los genes diferencialmente expresados
+```{r calulate_GO,include=TRUE,message=FALSE,echo=FALSE}
+
+library(org.Hs.eg.db)
+org <- org.Hs.eg.db
+hs <- org.Hs.eg.db
+
+library(pbapply)
+go_datas <- c("BP", "CC", "MF") %>% setNames(., .) %>%
+  pblapply(function(n) clusterProfiler:::get_GO_data(org.Hs.eg.db::org.Hs.eg.db, n, "ENTREZID") %>%
+           as.list() %>% as.environment())
+
+enrichGOOpt <- function (gene, OrgDB, goData, keyType = "ENTREZID", ont = "MF", pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH", universe=NULL, qvalueCutoff = 0.2, minGSSize = 10,
+                         maxGSSize = 500, readable = FALSE, pool = FALSE) {
+  ont %<>% toupper %>% match.arg(c("BP", "CC", "MF"))
+  #clusterProfiler:::GSEA()
+  res <- clusterProfiler:::enricher_internal(gene, pvalueCutoff = pvalueCutoff,
+                                             pAdjustMethod = pAdjustMethod, universe = universe,
+                                             qvalueCutoff = qvalueCutoff, minGSSize = minGSSize,
+                                             maxGSSize = maxGSSize, USER_DATA = goData)
+  if (is.null(res))
+    return(res)
+
+  res@keytype <- keyType
+  res@organism <- clusterProfiler:::get_organism(OrgDB)
+  if (readable) {
+    res <- DOSE::setReadable(res, OrgDB)
+  }
+  res@ontology <- ont
+
+  return(res)
+}
+
+
+
+distanceBetweenTerms <- function(go.df) {
+  genes.per.go <- sapply(go.df$geneID, strsplit, "/") %>% setNames(go.df$Description)
+  all.go.genes <- unique(unlist(genes.per.go))
+  all.gos <- unique(go.df$Description)
+
+  genes.per.go.mat <- matrix(0, length(all.go.genes), length(all.gos)) %>%
+    `colnames<-`(all.gos) %>% `rownames<-`(all.go.genes)
+
+  for (i in 1:length(genes.per.go)) {
+    genes.per.go.mat[genes.per.go[[i]], go.df$Description[[i]]] <- 1
+  }
+
+  return(dist(t(genes.per.go.mat), method="binary"))
+}
+
+calculateGos <- function(de, go.datas, n.top.genes=500,n.cores=1) {
+  de <- de[unlist(lapply(de,is.list))]
+
+  # add Z scores
+  de <- lapply(de,function(d) {
+    res.table <- d$res;
+    res.table$Z <- -qnorm(res.table$pval/2)
+    res.table$Z[is.na(res.table$Z)] <- 0
+    res.table$Za <- -qnorm(res.table$padj/2)
+    res.table$Za[is.na(res.table$Za)] <- 0
+    res.table$Z <- res.table$Z  * sign(res.table$log2FoldChange)
+    res.table$Za <- res.table$Za  * sign(res.table$log2FoldChange)
+    d$res <- res.table;
+    d
+  })
+  
+    gns <- list(down=lapply(de,function(x) rownames(x$res)[order(x$res$Z,decreasing=F)[1:n.top.genes]]),
+              up=lapply(de,function(x) rownames(x$res)[order(x$res$Z,decreasing=T)[1:n.top.genes]]),
+              all=lapply(de,function(x) rownames(x$res)))
+
+    
+    return(gns)
+   
+}
+
+calculateGosGSEA <- function(de, go.datas, n.top.genes=500,n.cores=1) {
+  de <- de[unlist(lapply(de,is.list))]
+  # add Z scores
+  de <- lapply(de,function(d) {
+    res.table <- d$res;
+    print(res.table)
+    res.table$Z <- res.table$pval
+    res.table$Za <- -qnorm(res.table$padj/2)
+    res.table$Za[is.na(res.table$Za)] <- 0
+    d$res <- res.table;
+    d
+  })
+    gns <- list(down=lapply(de,function(x) x$res[order(x$res$Z,decreasing=F),]),
+              up=lapply(de,function(x) x$res[order(x$res$Z,decreasing=T),]),
+              all=lapply(de,function(x) x$res))
+
+    
+    return(gns)
+   
+}
+
+GSEAGOOpt <- function (gene, OrgDB, goData, keyType = "ENTREZID", ont = "MF", pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH", universe=NULL, qvalueCutoff = 0.2, minGSSize = 10,
+                         maxGSSize = 500, readable = FALSE, pool = FALSE) {
+  ont %<>% toupper %>% match.arg(c("BP", "CC", "MF"))
+
+  nombres = rownames(gene)
+  gene = gene[,"log2FoldChange"]
+  names(gene) = nombres
+  #gene_list = gene_list[gene_list$res.padj < 0.05,]
+  gene_list_entrez <- select(hs, 
+       keys = names(gene),
+       columns = c("ENTREZID", "SYMBOL"),
+       keytype = "SYMBOL",
+       multiVals = 'first')
+  new_names = list()
+  for (name in names(gene)){
+    new_names = append(new_names,gene_list_entrez[gene_list_entrez$SYMBOL == name, 'ENTREZID'][[1]])
+    
+  }
+  names(gene) = new_names
+  gene <- unlist(gene[!is.na(names(gene))])
+  gene <-sort(gene, decreasing = TRUE)
+
+  res <- clusterProfiler:::gseGO(geneList = gene,
+                                 ont = "BP",
+                                 pAdjustMethod = 'BH',
+                                 OrgDb = OrgDB,
+                                 nPermSimple = 100000,
+                                 scoreType = "pos")
+  #res <- clusterProfiler:::enricher_internal(gene, pvalueCutoff = pvalueCutoff,
+  #                                           pAdjustMethod = pAdjustMethod, universe = universe,
+  #                                           qvalueCutoff = qvalueCutoff, minGSSize = minGSSize,
+  #                                           maxGSSize = maxGSSize, USER_DATA = goData)
+  print(res)
+  # if (is.null(res))
+  #   return(res)
+  # 
+  # res@keytype <- keyType
+  # res@organism <- clusterProfiler:::get_organism(OrgDB)
+  # if (readable) {
+  #   res <- DOSE::setReadable(res, OrgDB)
+  # }
+  #res@ontology <- ont
+
+  return(res)
+}
+
+gos_spat_gsea <- list(
+  annot=calculateGosGSEA(de_spat_annot_hombres, go_datas, n.top.genes=500)
+)
+
+gos_spat <- list(
+  annot=calculateGos(de_spat_annot_hombres, go_datas, n.top.genes=500)
+)
+
+gos_spat$annot <- lapply(gos_spat$annot,function(x)
+    lapply(x, clusterProfiler::bitr, 'SYMBOL', 'ENTREZID', org.Hs.eg.db::org.Hs.eg.db) %>%
+      lapply(`[[`, "ENTREZID"))
+
+gos.up.gsea <- mapply(function(x,y) {
+    GSEAGOOpt(gene = x, universe = y, ont = "BP", goData = go_datas[['BP']], 
+              OrgDB = org.Hs.eg.db::org.Hs.eg.db, readable = T)},
+  x = gos_spat_gsea$annot[[c("all")]],
+  y = gos_spat_gsea$annot[[c("all")]])
+
+gos.up <- mapply(function(x,y) {
+    enrichGOOpt(gene = x, universe = y, ont = "BP", goData = go_datas[['BP']], 
+              OrgDB = org.Hs.eg.db::org.Hs.eg.db, readable = T)},
+  x = gos_spat$annot[[c("up")]],
+  y = gos_spat$annot[[c("all")]])
+
+gos.down <- mapply(function(x,y) {
+    enrichGOOpt(gene = x, universe = y, ont = "BP", goData = go_datas[['BP']], 
+              OrgDB = org.Hs.eg.db::org.Hs.eg.db, readable = T)},
+  x = gos_spat$annot[[c("down")]],
+  y = gos_spat$annot[[c("all")]])
+
+
+gos_spat <- list("up"= gos.up, "down"= gos.down)
+```
+
+Calculo de los procesos GO downregulados
+``` {r downregulated_go,include=TRUE,message=FALSE,echo=FALSE}
+gj <- function(gos){
+  gos_filt <- lapply(gos,function(x) filter(x@result))
+  gos_joint <- do.call(rbind,gos_filt)
+  
+  gos_joint <- gos_filt %>% .[sapply(., nrow) > 0] %>% names() %>% setNames(., .) %>% lapply(function(n) cbind(gos_filt[[n]],Type=n)) %>% Reduce(rbind,.)
+  return(gos_joint)
+}
+
+g <- lapply(gos_spat, gj)
+
+g$down <- g$down[g$down$pvalue < 0.001,]
+g$down$p.adjust2 <- g$down$pvalue %>% p.adjust("bonferroni")
+gdc <- g$down[g$down$p.adjust2 < 0.05,]
+
+
+gdclusts <- distanceBetweenTerms(gdc) %>%  hclust(method='ward.D2') %>% cutree(20) 
+gdpc <- split(names(gdclusts), gdclusts)
+ngdc_per_clust <- sapply(gdpc, length)
+
+
+gdc %<>% mutate(GOClust=gdclusts[Description])
+gdname_per_clust <- gdc %>% group_by(GOClust, Description) %>% summarise(pvalue=exp(mean(log(pvalue)))) %>% 
+    split(.$GOClust) %>% sapply(function(df) df$Description[which.min(df$pvalue)])
+gdc %<>% mutate(GOClustName=gdname_per_clust[as.character(GOClust)])
+
+gdc_bp_summ_df <- gdc %>% group_by(Type, GOClustName) %>% 
+    summarise(p.adjust=min(p.adjust2)) %>% ungroup() %>% mutate(p.adjust=-log10(p.adjust)) %>% 
+    tidyr::spread(Type, p.adjust) %>% as.data.frame() %>% set_rownames(.$GOClustName) %>% .[, 2:ncol(.)] #%>% .[, type_order[type_order %in% colnames(.)]]
+gdc_bp_summ_df[is.na(gdc_bp_summ_df)] <- 0
+cols <- list(up=colorRamp2(c(0, 4), c("grey98", "red")),down=colorRamp2(c(0, 4), c("grey98", "blue")))
+n.clusters <- 20; max.pval <- 0.05;
+save(gdc_bp_summ_df,file = './data/guc_bp_summ_df_down_hombres.Rdata')
+save(cols,file = './data/cols_hombres.Rdata')
+Heatmap(as.matrix(gdc_bp_summ_df),
+             col=cols$down,
+              border=T,
+              show_row_dend=F,
+              show_column_dend=F, 
+              heatmap_legend_param = list(title = '-log10(adj.p)'), 
+              row_names_max_width = unit(10, "cm"),
+              row_names_gp = gpar(fontsize = 10), 
+              column_names_max_height = unit(8, "cm"),
+        column_order = order(as.numeric(gsub("L", "", colnames(gdc_bp_summ_df)))))
+```
+
+
+Calculo de los procesos GO upregulados
+``` {r upregulated_go,include=TRUE,message=FALSE,echo=FALSE}
+g <- lapply(gos_spat, gj)
+
+g$up <- g$up[g$up$pvalue < 0.001,]
+g$up$p.adjust2 <- g$up$pvalue %>% p.adjust("bonferroni")
+guc <- g$up[g$up$p.adjust2 < 0.05,]
+
+
+guclusts <- distanceBetweenTerms(guc) %>%  hclust(method='ward.D2') %>% cutree(20) 
+gupc <- split(names(guclusts), guclusts)
+nguc_per_clust <- sapply(gupc, length)
+
+
+guc %<>% mutate(GOClust=guclusts[Description])
+guname_per_clust <- guc %>% group_by(GOClust, Description) %>% summarise(pvalue=exp(mean(log(pvalue)))) %>% 
+    split(.$GOClust) %>% sapply(function(df) df$Description[which.min(df$pvalue)])
+guc %<>% mutate(GOClustName=guname_per_clust[as.character(GOClust)])
+
+
+guc_bp_summ_df <- guc %>% group_by(Type, GOClustName) %>% 
+    summarise(p.adjust=min(p.adjust2)) %>% ungroup() %>% mutate(p.adjust=-log10(p.adjust)) %>% 
+    tidyr::spread(Type, p.adjust) %>% as.data.frame() %>% set_rownames(.$GOClustName) %>% .[, 2:ncol(.)] #%>% .[, type_order[type_order %in% colnames(.)]]
+guc_bp_summ_df[is.na(guc_bp_summ_df)] <- 0
+
+save(guc_bp_summ_df,file = './data/guc_bp_summ_df_up_hombres.Rdata')
+Heatmap(as.matrix(guc_bp_summ_df),
+             col=cols$up,
+              border=T,
+              show_row_dend=F,
+              show_column_dend=F, 
+              heatmap_legend_param = list(title = '-log10(adj.p)'), 
+              row_names_max_width = unit(10, "cm"),
+              row_names_gp = gpar(fontsize = 10), 
+              column_names_max_height = unit(8, "cm"),
+        column_order = order(as.numeric(gsub("L", "", colnames(guc_bp_summ_df)))))
+```
+
+```{r}
+
+hs <- org.Hs.eg.db
+reactome_per_layer = list()
+
+for (layer in de_spat_annot_hombres) {
+  gene_list = as.data.frame(layer[1])
+  nombres = rownames(gene_list)
+  gene_list = gene_list[,"res.log2FoldChange"]
+  names(gene_list) = nombres
+  #gene_list = gene_list[gene_list$res.padj < 0.05,]
+  gene_list_entrez <- select(hs, 
+       keys = names(gene_list),
+       columns = c("ENTREZID", "SYMBOL"),
+       keytype = "SYMBOL",
+       multiVals = 'first')
+  new_names = list()
+  for (name in names(gene_list)){
+    new_names = append(new_names,gene_list_entrez[gene_list_entrez$SYMBOL == name, 'ENTREZID'][[1]])
+    
+  }
+  names(gene_list) = new_names
+  
+  gene_list <- unlist(gene_list[!is.na(names(gene_list))])
+  gene_list <-sort(gene_list, decreasing = TRUE)
+  #kk <- enrichPathway(gene=gene_list_entrez, pvalueCutoff = 0.05, readable=TRUE)
+  # kk <- clusterProfiler::enrichKEGG(gene = gene_list_entrez,
+  #                organism = 'hsa',
+  #                pAdjustMethod = 'BH',
+  #                pvalueCutoff = 0.05)
+  kk <- gsePathway(gene_list, 
+                pvalueCutoff = 0.05,
+                pAdjustMethod = "BH", 
+                verbose = TRUE)
+  reactome_per_layer <- append(reactome_per_layer,kk)
+  
+}
+
+save(reactome_per_layer,file = './data/reactome_per_layer_hombres.Rdata')
+
+```
+
+```{r}
+
+hs <- org.Hs.eg.db
+gseaGOOpt <- function (gene_list, OrgDB, keyType = "ENTREZID", ont = "MF", pvalueCutoff = 0.05,
+                         pAdjustMethod = "BH", universe=NULL, qvalueCutoff = 0.2, minGSSize = 10,
+                         maxGSSize = 500, readable = FALSE, pool = FALSE) {
+  ont %<>% toupper %>% match.arg(c("BP", "CC", "MF"))
+  gene_list = as.data.frame(gene_list)
+  nombres = rownames(gene_list)
+  gene_list = gene_list[,"res.log2FoldChange"]
+  names(gene_list) = nombres
+  #gene_list = gene_list[gene_list$res.padj < 0.05,]
+  gene_list_entrez <- AnnotationDbi::select(hs, 
+       keys = names(gene_list),
+       columns = c("ENTREZID", "SYMBOL"),
+       keytype = "SYMBOL",
+       multiVals = 'first')
+  new_names = list()
+  for (name in names(gene_list)){
+    new_names = append(new_names,gene_list_entrez[gene_list_entrez$SYMBOL == name, 'ENTREZID'][[1]])
+    
+  }
+  names(gene_list) = new_names
+  
+  gene_list <- unlist(gene_list[!is.na(names(gene_list))])
+  gene_list <-sort(gene_list, decreasing = TRUE)
+  res <- gseGO(geneList=gene_list, 
+             ont ="BP", 
+             keyType = "ENTREZID", 
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = OrgDB, 
+             pAdjustMethod = "bonferroni")
+  return(res)
+  # if (is.null(res))
+  #   return(res)
+  # 
+  # res@keytype <- keyType
+  # res@organism <- clusterProfiler:::get_organism(OrgDB)
+  # if (readable) {
+  #   res <- DOSE::setReadable(res, OrgDB)
+  # }
+  # res@ontology <- ont
+}
+
+go_gsea_per_layer = list()
+for (layer in de_spat_annot_hombres) {
+  go_gsea_per_layer <- append(go_gsea_per_layer,gseaGOOpt(layer[1],hs))
+  
+}
+save(go_gsea_per_layer,file='./data/go_gsea_per_layer_hombres.Rdata')
+```

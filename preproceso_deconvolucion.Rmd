@@ -1,0 +1,242 @@
+---
+title: "Preproceso para la deconvolucion"
+output: html_document
+date: "2023-03-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_libraries, include=TRUE, echo=FALSE, message=FALSE}
+library(readr)
+library(data.table)
+library(scrattch.io)
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(pagoda2)
+library(trqwe)
+```
+
+# Including Plots
+
+Para realizar el proceso de deconvolución es necesario emplear un dataset de single cell de referencia. Dado que ene este estudio se ha secuenciado tanto un dataset de transcriptomica espacial, así como uno de single nucleous de la misma zona del cerebro para muchos de los pacientes, lo que hicieron es utilizar estos datasets generados combinandolos para crear el dataset de referencia con el que realizar la deconvolución.
+
+No obstante los dataset generados solo contienen neuronas, y por ello a estos datasets se han añadidio las celulas gliales que existen en el cortex, extrayendose estas de un dataset de referencia generado por el Instituto Allen.
+
+El proceso se ha realizado de la siguiente manera. Primero se cargan las matrices de conteos de snRNA-Seq y se seleccionan las muestras MB14, MB15 y MB17, que son las unicas que se han empleado en el estudio (Nota: Aunque se ha empleado la muestra MB17, lueg esta muestra no tiene dataset de transcriptomica espacial, **No tengo claro el porque del uso de esta muestra**})
+
+``` {r load_raw_data, include=TRUE, message=FALSE}
+snraw = read_rds('/home/jsantiago/snRNA-seq_and_spatial_transcriptomics/snRNA-seq_raw_countmatrices.RDS')
+cms_scz <- c(snraw$MB14, snraw$MB15, snraw$MB17)
+rm(snraw)
+```
+
+
+A continuación se cargan las anotaciones que contienen el tipo celular de cada una de las celulas presentens en las matrices de conteo, y se le asigna este nombre a las columnas para su mejor identificación.
+
+```{r load_snRNA-seq_annot, include=TRUE, message=FALSE}
+annotations_scz2 <- read_rds("./snRNA-seq_and_spatial_transcriptomics/annotations_final.RDS")
+cms_scz <- lapply(cms_scz, function(smpl) {smpl[, colnames(smpl) %in% names(annotations_scz2$high.clean)]}) 
+
+```
+
+Segudiamente se cargan las anotaciones y los datos del Dataset de referencia del Allen Institutte de donde se obtendrán las células gliales
+
+```{r}
+annotation_allen <- fread("/home/jsantiago/snRNA-seq_and_spatial_transcriptomics/sample_annotations.csv")
+allen_exon <- read_tome_dgCMatrix(tome = "/home/jsantiago/snRNA-seq_and_spatial_transcriptomics/transcrip.tome", 
+                                  target = "data/t_exon")
+allen_intron <- read_tome_dgCMatrix(tome = "/home/jsantiago/snRNA-seq_and_spatial_transcriptomics/transcrip.tome", 
+                                    target = "data/t_intron")
+```
+
+Se procesan los datos del dataset Allen juntando los exones e intrones (vienen separados) y estableceindo el nombre de las filas y las columnas a partir de la anotación.
+
+```{r}
+allen_smpl_names <- read_tome_sample_names(tome = "snRNA-seq_and_spatial_transcriptomics/transcrip.tome")
+allen_gene_names <- read_tome_gene_names(tome = "snRNA-seq_and_spatial_transcriptomics/transcrip.tome")
+allen_cm <- allen_exon + allen_intron
+rm(list= c('allen_exon','allen_intron'))
+rownames(x = allen_cm) <- allen_gene_names
+colnames(x = allen_cm) <- allen_smpl_names
+```
+
+A partir de los datos se extrae en una lista cada uno de los tipos celulares que se quieren analizar (6 listas en total), y se combinan.
+
+```{r split_allen,include=TRUE,message=FALSE}
+allen_list_1 <- lapply(annotation_allen$external_donor_name_label %>% unique(), 
+                     function(x) 
+                       allen_cm[ ,annotation_allen$external_donor_name_label == x &
+                                  annotation_allen$region_label == "CgG" &
+                                   annotation_allen$class_label == "Non-neuronal"]) %>% 
+  setNames(paste0("ACC_", annotation_allen$external_donor_name_label %>% unique()))
+
+
+allen_list_2 <- lapply(annotation_allen$external_donor_name_label %>% unique(), 
+                     function(x) 
+                       allen_cm[ ,annotation_allen$external_donor_name_label == x &
+                                  annotation_allen$region_label == "MTG"  &
+                                   annotation_allen$class_label == "Non-neuronal"]) %>% 
+  setNames(paste0("MTG_", annotation_allen$external_donor_name_label %>% unique()))
+
+
+allen_list_3 <- lapply(annotation_allen$external_donor_name_label %>% unique(), 
+                     function(x) 
+                       allen_cm[ ,annotation_allen$external_donor_name_label == x &
+                                  (annotation_allen$region_label == "M1ul" | annotation_allen$region_label == "M1lm") &
+                                   annotation_allen$class_label == "Non-neuronal"]) %>% 
+  setNames(paste0("M1_", annotation_allen$external_donor_name_label %>% unique()))
+
+
+allen_list_4 <- lapply(annotation_allen$external_donor_name_label %>% unique(), 
+                     function(x) 
+                       allen_cm[ ,annotation_allen$external_donor_name_label == x &
+                                  annotation_allen$region_label == "V1C"  &
+                                   annotation_allen$class_label == "Non-neuronal"]) %>% 
+  setNames(paste0("V1C_", annotation_allen$external_donor_name_label %>% unique()))
+
+
+
+
+allen_list_5 <- lapply(annotation_allen$external_donor_name_label %>% unique(), 
+                     function(x) 
+                       allen_cm[ ,annotation_allen$external_donor_name_label == x &
+                                  (annotation_allen$region_label == "S1ul" | annotation_allen$region_label == "S1lm") &
+                                   annotation_allen$class_label == "Non-neuronal"]) %>% 
+  setNames(paste0("S1_", annotation_allen$external_donor_name_label %>% unique()))
+
+
+allen_list_6 <- lapply(annotation_allen$external_donor_name_label %>% unique(), 
+                     function(x) 
+                       allen_cm[ ,annotation_allen$external_donor_name_label == x &
+                                  annotation_allen$region_label == "A1C"  &
+                                   annotation_allen$class_label == "Non-neuronal"]) %>% 
+  setNames(paste0("A1C_", annotation_allen$external_donor_name_label %>% unique()))
+
+allen_list <- c(allen_list_1, allen_list_2, allen_list_3, allen_list_4, allen_list_5, allen_list_6)
+rm(list= c('allen_list_1','allen_list_2','allen_list_3','allen_list_4','allen_list_5','allen_list_6'))
+```
+
+Se van a integrar ambos datasets empleando la libreria Seurat.
+
+```{r integrate_data,include=TRUE,message=FALSE, echo=FALSE}
+#merge allen and scz countmatrics lists
+scz_all_cms <- append(cms_scz, allen_list)
+
+
+#create Seurat objects
+seu_scz_all <- lapply(scz_all_cms, CreateSeuratObject)
+
+
+#run SCTransform on all memebers
+seu_scz_all <- lapply(seu_scz_all, SCTransform) 
+
+
+#select features for downstream integration
+scz_all_features <- SelectIntegrationFeatures(object.list = seu_scz_all, nfeatures = 3000)
+
+#run PrepSCTIntegration
+seu_scz_all <- PrepSCTIntegration(object.list = seu_scz_all, anchor.features = scz_all_features)
+
+
+#find anchors
+scz_all_anchors <- FindIntegrationAnchors(object.list = seu_scz_all, normalization.method = "SCT", 
+                                          anchor.features = scz_all_features,
+                                          k.filter = 130 #needed to decrease, error when integr small and big datasets
+                                          )
+
+
+#integrate schizo and allen data
+scz_all_integrated <- IntegrateData(anchorset = scz_all_anchors, normalization.method = "SCT")
+
+
+#Run PCA
+scz_all_integrated <- RunPCA(scz_all_integrated)
+
+#Run UMAP
+scz_all_integrated <- RunUMAP(scz_all_integrated, dims = 1:30)
+#saveRDS(scz_all_integrated, "scz_all_integrated.RDS")
+rm(list= c('scz_all_features','scz_all_anchors','seu_sc_all'))
+```
+
+A continuación se cargan las matrices de conteo del dataset Allen para las celulas Gliales, y se obtienen los nombres de los tipos celulares presentes:
+
+``` {r allen_count_matrix, include=TRUE,message=FALSE}
+cm_glia <- as.matrix(read.csv("./cm.csv"))
+rownames(cm_glia) <- cm_glia[,1]
+cm_glia <- cm_glia[,-1]
+annot_glia <- read.csv("./filtered_metadata.csv")
+rownames(annot_glia) = annot_glia[,'sample_name']
+
+scz_all_integrated$subtypes_med <- annotations_scz2$med[names(Idents(scz_all_integrated))]
+scz_all_integrated$subtypes_high <- annotations_scz2$high[names(Idents(scz_all_integrated))]
+scz_all_integrated$origin <- setNames(
+  gsub("^[^(MB)].*", "Allen", names(annotations_scz2$high)) %>% gsub("^MB.*", "Scz", .),
+  names(annotations_scz2$high))[names(Idents(scz_all_integrated))]
+
+so_subs <- subset(scz_all_integrated, (origin == "Scz") & (subtypes_high != "Glia"))
+hsub_order <- annotations_scz2$high.clean
+msub_order <- annotations_scz2$med.clean
+hsub_order_allen_10x <- factor(c(hsub_order[-c(length(hsub_order), length(hsub_order) -1)], 
+                            "Astro_L1_FGFR3_SERPINI2", "Astro_L1_6_FGFR3_AQP1", "Astro_L1_6_FGFR3_PLCG1", 
+                            "Oligo_L2_6_OPALIN_FTH1P3", "Oligo_L3_6_OPALIN_ENPP6", "Oligo_L2_6_OPALIN_MAP6D1",
+                            "Oligo_L5_6_OPALIN_LDLRAP1", "OPC_L1_6_PDGFRA_COL20A1", "Micro_L1_6_TYROBP_CD74", 
+                            "Endo_L2_5_NOSTRIN_SRGN", "VLMC_L1_5_PDGFRA_COLEC12"), 
+                           
+                           levels = c(unique(hsub_order[-c(length(hsub_order), length(hsub_order) -1)]), 
+                             "Astro_L1_FGFR3_SERPINI2", "Astro_L1_6_FGFR3_AQP1", "Astro_L1_6_FGFR3_PLCG1", 
+                            "Oligo_L2_6_OPALIN_FTH1P3", "Oligo_L3_6_OPALIN_ENPP6", "Oligo_L2_6_OPALIN_MAP6D1",
+                            "Oligo_L5_6_OPALIN_LDLRAP1", "OPC_L1_6_PDGFRA_COL20A1", "Micro_L1_6_TYROBP_CD74", 
+                            "Endo_L2_5_NOSTRIN_SRGN", "VLMC_L1_5_PDGFRA_COLEC12"),
+                           ordered = T)
+msub_order_allen_10x <- factor(c(msub_order[-c(length(msub_order), length(msub_order) -1)], 
+                            "Astro", "Oligo", "OPC", "Micro_PVM", "Endo", "VLMC"), 
+                           levels = unique(msub_order),ordered = T)
+```
+
+Para realizar la deconvolucion no se han empelado todos los genes, sino que se han analizado los genes mas variables (HVGs) de una de las muestras (la muestra MB11) para empelar esos genes. 
+
+``` {r get_hgvs, include=TRUE,message=FALSE}
+mb11 = Seurat::Read10X_h5(
+                paste0("./snRNA-seq_and_spatial_transcriptomics/visium_spaceranger_output/",
+                       'MB11', "/outs/filtered_feature_bc_matrix.h5"))
+mb11 = CreateSeuratObject(mb11,assay = 'Spatial')
+var_genes_3k <- mb11 %>% FindVariableFeatures(assay="Spatial", nfeatures=3000) %>% 
+  .@assays %>% .$Spatial %>% .@var.features
+var_genes_1k <- mb11 %>% FindVariableFeatures(assay="Spatial", nfeatures=1000) %>% 
+  .@assays %>% .$Spatial %>% .@var.features
+```
+
+Se combianan todas las matrices de conteo de las muestras en una única matriz de conteos, que se utilizará como referencia.
+
+``` {r merge_count_matrices, include=TRUE,message=FALSE}
+asChn <- function(x) setNames(as.character(x), names(x))
+cm_merged <- so_subs@assays$RNA@counts %>% list(as.integer(t(cm_glia))) %>% 
+  conos:::mergeCountMatrices(transposed=F)
+annotation_merged <- asChn(so_subs$subtypes_med) %>% c(asChn(annotations_scz2$med))
+annotation_merged_high <- asChn(so_subs$subtypes_high) %>% c(asChn(annotations_scz2$high))
+p_vals <- colSums(cm_merged > 0) %>% split(annotation_merged[names(.)]) %>% 
+  sapply(mean)
+```
+
+Se guardan todos los datos para poder realizar la deconvolucion
+
+``` {r save_data, include=TRUE,message=FALSE}
+cm_merged[var_genes_3k,] %>% Matrix::t() %>% as.matrix() %>% 
+  as.data.frame() %>% data.table::fwrite("./deconvolution/cm_with_glia2.tsv", sep="\t", row.names=T)
+cm_norm <- Pagoda2$new(cm_merged)$counts
+cm_norm[, var_genes_3k] %>% as.matrix() %>% as.data.frame() %>% 
+  data.table::fwrite("./deconvolution/cm_with_glia_norm2.tsv", sep="\t", row.names=T)
+as_tibble(annotation_merged, row.names="cell") %>% 
+  set_colnames(c("cell", "bio_celltype")) %>% 
+  write_delim("./deconvolution/annotation_med2.tsv", delim="\t")
+df = as.data.frame(annotation_merged_high, row.names=names(annotation_merged_high)) 
+df$barcode = rownames(df)
+df = df[,c(2,1)]
+  set_colnames(df,c("cell", "bio_celltype")) %>% 
+  write_delim("./deconvolution/annotation_med_high.tsv", delim="\t")
+```
+
+
